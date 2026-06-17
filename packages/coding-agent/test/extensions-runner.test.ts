@@ -66,6 +66,14 @@ describe("ExtensionRunner", () => {
 		setModel: async () => false,
 		getThinkingLevel: () => "off",
 		setThinkingLevel: () => {},
+		sessionsHost: {
+			listSessions: () => [],
+			getSession: () => undefined,
+			observeSession: () => () => {},
+			focusSession: async () => {},
+			createSession: async () => "",
+			closeSession: async () => {},
+		},
 	};
 
 	const extensionContextActions: ExtensionContextActions = {
