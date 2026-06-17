@@ -32,6 +32,10 @@ import type {
 	ExtensionShortcut,
 	ExtensionUIContext,
 	InputEvent,
+	LoadExtensionsResult,
+	ProjectTrustContext,
+	ProjectTrustEvent,
+	ProjectTrustEventResult,
 	InputEventResult,
 	InputSource,
 	MessageEndEvent,
@@ -148,6 +152,9 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
 
+/** Observes mapped extension events (the pi.on vocabulary) with the in-session ctx. */
+export type ExtensionEventObserver = (event: ExtensionEvent, ctx: ExtensionContext) => void | Promise<void>;
+
 export type NewSessionHandler = (options?: {
 	parentSession?: string;
 	setup?: (sessionManager: SessionManager) => Promise<void>;
@@ -181,14 +188,46 @@ export async function emitSessionShutdownEvent(
 	extensionRunner: ExtensionRunner,
 	event: SessionShutdownEvent,
 ): Promise<boolean> {
-	if (extensionRunner.hasHandlers("session_shutdown")) {
+	// Emit when an own handler exists OR a cross-session observer is watching, so a
+	// handle.on("session_shutdown", ...) observer fires even on a target with no own handler.
+	if (extensionRunner.hasHandlers("session_shutdown") || extensionRunner.hasObservers()) {
 		await extensionRunner.emit(event);
 		return true;
 	}
 	return false;
 }
 
-const noOpUIContext: ExtensionUIContext = {
+export async function emitProjectTrustEvent(
+	extensionsResult: LoadExtensionsResult,
+	event: ProjectTrustEvent,
+	ctx: ProjectTrustContext,
+): Promise<{ result?: ProjectTrustEventResult; errors: ExtensionError[] }> {
+	const errors: ExtensionError[] = [];
+	for (const ext of extensionsResult.extensions) {
+		const handlers = ext.handlers.get("project_trust");
+		if (!handlers || handlers.length === 0) continue;
+
+		for (const handler of handlers) {
+			try {
+				const handlerResult = (await handler(event, ctx)) as ProjectTrustEventResult;
+				if (handlerResult.trusted === "undecided") {
+					continue;
+				}
+				return { result: handlerResult, errors };
+			} catch (error) {
+				errors.push({
+					extensionPath: ext.path,
+					event: event.type,
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined,
+				});
+			}
+		}
+	}
+	return { errors };
+}
+
+export const noOpUIContext: ExtensionUIContext = {
 	select: async () => undefined,
 	confirm: async () => false,
 	input: async () => undefined,
@@ -229,6 +268,7 @@ export class ExtensionRunner {
 	private sessionManager: SessionManager;
 	private modelRegistry: ModelRegistry;
 	private errorListeners: Set<ExtensionErrorListener> = new Set();
+	private eventObservers: Set<ExtensionEventObserver> = new Set();
 	private getModel: () => Model<any> | undefined = () => undefined;
 	private isIdleFn: () => boolean = () => true;
 	private getSignalFn: () => AbortSignal | undefined = () => undefined;
@@ -286,6 +326,7 @@ export class ExtensionRunner {
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+		this.runtime.sessionsHost = actions.sessionsHost;
 
 		// Context actions (required)
 		this.getModel = contextActions.getModel;
@@ -489,6 +530,44 @@ export class ExtensionRunner {
 		}
 	}
 
+	/**
+	 * Observe mapped extension events (the pi.on vocabulary) with the same shape and
+	 * context in-session handlers receive. Cross-session SessionHandle.on uses this so
+	 * observers of another session get pi.on-shaped events, not the raw AgentSessionEvent
+	 * stream. Fires for the observation events routed through emit()/emitMessageEnd();
+	 * interceptor events (tool_call/context/before_provider_request/...) are not observed.
+	 */
+	observeEvents(observer: ExtensionEventObserver): () => void {
+		this.eventObservers.add(observer);
+		return () => this.eventObservers.delete(observer);
+	}
+
+	private notifyObservers(event: ExtensionEvent, ctx: ExtensionContext): void {
+		const report = (err: unknown) =>
+			this.emitError({
+				extensionPath: "<session handle observer>",
+				event: event.type,
+				error: err instanceof Error ? err.message : String(err),
+				stack: err instanceof Error ? err.stack : undefined,
+			});
+		for (const observer of this.eventObservers) {
+			try {
+				// Observers may be async (e.g. an async SessionHandle.on handler). emit() does not
+				// await notifyObservers, so a rejected promise would surface as an unhandled
+				// rejection; route it to the error sink instead, matching how emit() catches the
+				// awaited pi.on handlers. Promise.resolve() (not `instanceof Promise`) so a thenable
+				// or cross-realm promise from a handler is adopted too — `instanceof` would miss it
+				// and let its rejection escape.
+				const result = observer(event, ctx);
+				if (result !== undefined) {
+					Promise.resolve(result).catch(report);
+				}
+			} catch (err) {
+				report(err);
+			}
+		}
+	}
+
 	hasHandlers(eventType: string): boolean {
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get(eventType);
@@ -497,6 +576,16 @@ export class ExtensionRunner {
 			}
 		}
 		return false;
+	}
+
+	/**
+	 * Whether any cross-session observer (SessionHandle.on) is registered. Lifecycle emit
+	 * helpers gate emit() on hasHandlers() to skip work when nobody listens; an observer is
+	 * a catch-all that filters by event type itself, so its presence means observable
+	 * lifecycle events must still be emitted for it to receive them.
+	 */
+	hasObservers(): boolean {
+		return this.eventObservers.size > 0;
 	}
 
 	getMessageRenderer(customType: string): MessageRenderer | undefined {
@@ -679,6 +768,7 @@ export class ExtensionRunner {
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
 		const ctx = this.createContext();
+		this.notifyObservers(event, ctx);
 		let result: SessionBeforeEventResult | undefined;
 
 		for (const ext of this.extensions) {
@@ -749,6 +839,11 @@ export class ExtensionRunner {
 				}
 			}
 		}
+
+		// Notify cross-session observers AFTER the handler loop, with the final message: a
+		// message_end handler may have returned a replacement, and handle.on subscribers must
+		// see the same message that gets persisted/emitted for the session (pi.on parity).
+		this.notifyObservers(modified ? { ...event, message: currentMessage } : event, ctx);
 
 		return modified ? currentMessage : undefined;
 	}

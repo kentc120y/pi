@@ -24,6 +24,7 @@ import { CONFIG_DIR_NAME, getAgentDir, isBunBinary } from "../../config.ts";
 // avoiding a circular dependency. Extensions can import from @earendil-works/pi-coding-agent.
 import * as _bundledPiCodingAgent from "../../index.ts";
 import { resolvePath } from "../../utils/paths.ts";
+import type { AgentSession } from "../agent-session.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
@@ -37,6 +38,8 @@ import type {
 	MessageRenderer,
 	ProviderConfig,
 	RegisteredCommand,
+	SessionHandle,
+	SessionsController,
 	ToolDefinition,
 } from "./types.ts";
 
@@ -148,6 +151,16 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		setModel: () => Promise.reject(new Error("Extension runtime not initialized")),
 		getThinkingLevel: notInitialized,
 		setThinkingLevel: notInitialized,
+		sessionsHost: {
+			listSessions: notInitialized,
+			getSession: notInitialized,
+			observeSession: () => {
+				throw new Error("Extension runtime not initialized");
+			},
+			focusSession: () => Promise.reject(new Error("Extension runtime not initialized")),
+			createSession: () => Promise.reject(new Error("Extension runtime not initialized")),
+			closeSession: () => Promise.reject(new Error("Extension runtime not initialized")),
+		},
 		flagValues: new Map(),
 		pendingProviderRegistrations: [],
 		assertActive,
@@ -180,6 +193,109 @@ function createExtensionAPI(
 	cwd: string,
 	eventBus: EventBus,
 ): ExtensionAPI {
+	// `pi.sessions` controller. Delegates to the shared runtime host (runtime.sessionsHost)
+	// so cross-session operations always resolve against the live runtime, not a single
+	// captured session. Pre-bind, the host is a throwing stub (see createExtensionRuntime).
+
+	// Resolve a session by id, throwing if it is gone. Handle methods that await before
+	// acting on a session MUST re-resolve through this afterward (passing the captured
+	// session as `expected`): the session can close — or be disposed and recreated at the
+	// same id by resume/import — while the await is pending, and acting on the stale object
+	// would drive a disposed session.
+	const getLiveSessionOrThrow = (sessionId: string, expected?: AgentSession): AgentSession => {
+		const session = runtime.sessionsHost.getSession(sessionId);
+		if (!session || (expected && session !== expected)) {
+			throw new Error(`Session not found: ${sessionId}`);
+		}
+		return session;
+	};
+
+	const makeHandle = (id: string): SessionHandle => ({
+		id,
+		// O(n) per access (re-reads listSessions); fine for the small number of live sessions.
+		get name() {
+			runtime.assertActive();
+			return runtime.sessionsHost.listSessions().find((s) => s.id === id)?.name;
+		},
+		get status() {
+			runtime.assertActive();
+			const info = runtime.sessionsHost.listSessions().find((s) => s.id === id);
+			// A missing session is one this handle outlived (closed/replaced); report it as
+			// such instead of letting it fall through to "idle" and masquerade as live.
+			if (!info) return "closed";
+			return info.isBusy ? "busy" : "idle";
+		},
+		focus: () => {
+			runtime.assertActive();
+			return runtime.sessionsHost.focusSession(id);
+		},
+		close: () => {
+			runtime.assertActive();
+			return runtime.sessionsHost.closeSession(id);
+		},
+		on: (type, handler) => {
+			runtime.assertActive();
+			// Observe the mapped extension events (the pi.on vocabulary) with the in-session
+			// ctx, so cross-session handlers match what a same-session pi.on handler sees.
+			// Subscribe through the host keyed by id, not the session object directly: a same-id
+			// replacement (/resume or /import of the focused session) swaps in a new AgentSession
+			// under the same id, and the host re-homes this observer to the new runner so delivery
+			// survives. The observer outlives the owning extension's session; once that owner is
+			// disposed/replaced (its runtime goes stale), stop delivering and remove the observer
+			// so the owner's callback can't keep firing — and leaking stale extension code —
+			// across session lifetimes. A no-op unsubscribe if the id is already gone.
+			const unsubscribe = runtime.sessionsHost.observeSession(id, (event, ctx) => {
+				try {
+					runtime.assertActive();
+				} catch {
+					unsubscribe();
+					return;
+				}
+				if (event.type === type) {
+					// Return the (possibly async) handler result so notifyObservers can route a
+					// rejected promise to the error sink, matching how emit() awaits pi.on handlers;
+					// otherwise an async handle.on handler's rejection escapes as an unhandled
+					// rejection.
+					return handler(event as never, ctx as never);
+				}
+			});
+			return unsubscribe;
+		},
+		sendUserMessage: async (content, options) => {
+			runtime.assertActive();
+			// The session's extensions are fully bound before any handle is observable (a
+			// background create awaits session_start + resource discovery before resolving),
+			// so the prompt always runs against the complete toolset/resources — no readiness
+			// wait needed. Throws if the session is already gone.
+			const session = getLiveSessionOrThrow(id);
+			await session.sendUserMessage(content, options);
+		},
+		abort: async () => {
+			runtime.assertActive();
+			await getLiveSessionOrThrow(id).abort();
+		},
+	});
+	const sessions: SessionsController = {
+		list: () => {
+			runtime.assertActive();
+			return runtime.sessionsHost.listSessions().map((s) => makeHandle(s.id));
+		},
+		get: (id) => {
+			runtime.assertActive();
+			return runtime.sessionsHost.getSession(id) ? makeHandle(id) : undefined;
+		},
+		get focused() {
+			runtime.assertActive();
+			const focusedInfo = runtime.sessionsHost.listSessions().find((s) => s.isFocused);
+			if (!focusedInfo) throw new Error("No focused session");
+			return makeHandle(focusedInfo.id);
+		},
+		create: async (options) => {
+			runtime.assertActive();
+			return makeHandle(await runtime.sessionsHost.createSession(options));
+		},
+	};
+
 	const api = {
 		// Registration methods - write to extension
 		on(event: string, handler: HandlerFn): void {
@@ -321,6 +437,8 @@ function createExtensionAPI(
 			runtime.assertActive();
 			runtime.unregisterProvider(name, extension.path);
 		},
+
+		sessions,
 
 		events: eventBus,
 	} as ExtensionAPI;

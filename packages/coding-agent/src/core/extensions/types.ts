@@ -41,6 +41,7 @@ import type {
 } from "@earendil-works/pi-tui";
 import type { Static, TSchema } from "typebox";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
+import type { AgentSession } from "../agent-session.ts";
 import type { BashResult } from "../bash-executor.ts";
 import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
 import type { EventBus } from "../event-bus.ts";
@@ -295,10 +296,14 @@ export interface CompactOptions {
 /**
  * Context passed to extension event handlers.
  */
+export type ExtensionMode = "tui" | "rpc" | "json" | "print";
+
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
-	/** Whether UI is available (false in print/RPC mode) */
+	/** Current run mode. Use "tui" to guard terminal-only UI such as custom components. */
+	mode: ExtensionMode;
+	/** Whether dialog-capable UI is available (true in TUI and RPC modes) */
 	hasUI: boolean;
 	/** Current working directory */
 	cwd: string;
@@ -488,8 +493,32 @@ export function defineTool<TParams extends TSchema, TDetails = unknown, TState =
 }
 
 // ============================================================================
-// Resource Events
+// Startup/Resource Events
 // ============================================================================
+
+export interface ProjectTrustEvent {
+	type: "project_trust";
+	cwd: string;
+}
+
+export type ProjectTrustEventDecision = "yes" | "no" | "undecided";
+
+export interface ProjectTrustEventResult {
+	trusted: ProjectTrustEventDecision;
+	remember?: boolean;
+}
+
+export interface ProjectTrustContext {
+	cwd: string;
+	mode: ExtensionMode;
+	hasUI: boolean;
+	ui: Pick<ExtensionUIContext, "select" | "confirm" | "input" | "notify">;
+}
+
+export type ProjectTrustHandler = (
+	event: ProjectTrustEvent,
+	ctx: ProjectTrustContext,
+) => Promise<ProjectTrustEventResult> | ProjectTrustEventResult;
 
 /** Fired after session_start to allow extensions to provide additional resource paths. */
 export interface ResourcesDiscoverEvent {
@@ -556,6 +585,22 @@ export interface SessionShutdownEvent {
 	targetSessionFile?: string;
 }
 
+/**
+ * Fired when a session becomes the focused (interactive) session. Fires on every
+ * focus, including the first — so extensions can (re)install UI (footer, header,
+ * widgets, custom editor) that the host tears down when the session is backgrounded.
+ * Use this, not session_start, for UI that must survive focus switches; session_start
+ * stays once-per-session for data/side-effect setup.
+ */
+export interface SessionFocusEvent {
+	type: "session_focus";
+}
+
+/** Fired when a live session loses focus (backgrounded, but not torn down). */
+export interface SessionBlurEvent {
+	type: "session_blur";
+}
+
 /** Preparation data for tree navigation */
 export interface TreePreparation {
 	targetId: string;
@@ -594,6 +639,8 @@ export type SessionEvent =
 	| SessionBeforeCompactEvent
 	| SessionCompactEvent
 	| SessionShutdownEvent
+	| SessionFocusEvent
+	| SessionBlurEvent
 	| SessionBeforeTreeEvent
 	| SessionTreeEvent;
 
@@ -948,6 +995,7 @@ export function isToolCallEventType(toolName: string, event: ToolCallEvent): boo
 
 /** Union of all event types */
 export type ExtensionEvent =
+	| ProjectTrustEvent
 	| ResourcesDiscoverEvent
 	| SessionEvent
 	| ContextEvent
@@ -970,6 +1018,27 @@ export type ExtensionEvent =
 	| InputEvent
 	| ToolCallEvent
 	| ToolResultEvent;
+
+/**
+ * The events a cross-session SessionHandle.on observer can receive — the session
+ * lifecycle and agent-observation events routed through the runner's emit()/
+ * emitMessageEnd(). The interceptor events (tool_call, tool_result, context,
+ * before_provider_request, user_bash, resources_discover, etc.) are deliberately not
+ * delivered cross-session, so handle.on is typed against this subset to keep callers
+ * from subscribing to events that would silently never fire.
+ */
+export type ObservableSessionEvent =
+	| SessionEvent
+	| AgentStartEvent
+	| AgentEndEvent
+	| TurnStartEvent
+	| TurnEndEvent
+	| MessageStartEvent
+	| MessageUpdateEvent
+	| MessageEndEvent
+	| ToolExecutionStartEvent
+	| ToolExecutionUpdateEvent
+	| ToolExecutionEndEvent;
 
 // ============================================================================
 // Event Results
@@ -1078,6 +1147,100 @@ export interface ResolvedCommand extends RegisteredCommand {
 // biome-ignore lint/suspicious/noConfusingVoidType: void allows bare return statements
 export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContext) => Promise<R | void> | R | void;
 
+// ============================================================================
+// Sessions
+// ============================================================================
+
+/** Lightweight view of a session held by the runtime. */
+export interface RuntimeSessionInfo {
+	id: string;
+	name: string | undefined;
+	isFocused: boolean;
+	isBusy: boolean;
+}
+
+/**
+ * Host interface implemented by the runtime that owns all live sessions.
+ *
+ * The session-scoped `pi.sessions` controller delegates to this host so that
+ * cross-session operations resolve against the shared runtime, not a single
+ * captured session.
+ */
+export interface SessionsHost {
+	listSessions(): RuntimeSessionInfo[];
+	getSession(id: string): AgentSession | undefined;
+	/**
+	 * Observe a session's mapped extension events by id, backing SessionHandle.on(). Keyed by
+	 * id — not bound to the AgentSession object — so the observer survives a same-id
+	 * replacement (e.g. /resume or /import of the focused session swaps in a new object under
+	 * the same id) by being re-homed to the new object's runner. Returns an unsubscribe fn.
+	 */
+	observeSession(
+		id: string,
+		observer: (event: ExtensionEvent, ctx: ExtensionContext) => void | Promise<void>,
+	): () => void;
+	focusSession(id: string): Promise<void>;
+	createSession(options?: { resume?: string; focus?: boolean; autonomous?: boolean }): Promise<string>;
+	closeSession(id: string): Promise<void>;
+}
+
+/**
+ * Status of a session exposed to extensions. `closed` lets a holder of a stale handle
+ * (e.g. a session switcher) tell a gone session apart from a live one, rather than both
+ * reporting `idle`. (There is no `starting`: a session's extensions finish binding —
+ * session_start + resource discovery — before `pi.sessions.create()` resolves, so a
+ * session is never observable in a half-started state.)
+ */
+export type SessionStatus = "idle" | "busy" | "closed";
+
+/** Handle to a single session, returned by the `pi.sessions` controller. */
+export interface SessionHandle {
+	readonly id: string;
+	readonly name: string | undefined;
+	readonly status: SessionStatus;
+	focus(): Promise<void>;
+	close(): Promise<void>;
+	/**
+	 * Observe this session's mapped extension events — the same pi.on vocabulary and
+	 * event shapes (with ctx) an in-session handler receives, not the raw event stream.
+	 * Covers the observation events (agent/turn/message/tool_execution/session_*);
+	 * interceptor events (tool_call/context/...) are not delivered. Returns an
+	 * unsubscribe function.
+	 */
+	on<T extends ObservableSessionEvent["type"]>(
+		type: T,
+		handler: (event: Extract<ObservableSessionEvent, { type: T }>, ctx: ExtensionContext) => void,
+	): () => void;
+	/**
+	 * Send a user message to this session. Runs the full prompt path and resolves once the
+	 * underlying prompt has been processed. The session's extensions are already fully bound
+	 * (session_start + resource discovery complete before any handle is observable), so the
+	 * turn always sees the complete toolset/resources. Rejects if the session is gone.
+	 * (Unlike `ExtensionAPI.sendUserMessage`, the promise is surfaced so cross-session callers
+	 * can await/catch it.)
+	 */
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options?: { deliverAs?: "steer" | "followUp" },
+	): Promise<void>;
+	abort(): Promise<void>;
+}
+
+/** Controller exposed as `pi.sessions` for managing live sessions. */
+export interface SessionsController {
+	list(): SessionHandle[];
+	get(id: string): SessionHandle | undefined;
+	/** The focused session. Throws if there is somehow no focused session (should never happen at runtime). */
+	readonly focused: SessionHandle;
+	/**
+	 * Create a session. `autonomous: true` makes it a non-attended session: while it is
+	 * not focused, extension UI prompts proceed immediately with a safe default instead
+	 * of waiting for the user. An attended (default) session's prompts defer until it is
+	 * focused. Either kind is fully interactive once focused.
+	 */
+	create(options?: { resume?: string; focus?: boolean; autonomous?: boolean }): Promise<SessionHandle>;
+}
+
 /**
  * ExtensionAPI passed to extension factory functions.
  */
@@ -1086,6 +1249,7 @@ export interface ExtensionAPI {
 	// Event Subscription
 	// =========================================================================
 
+	on(event: "project_trust", handler: ProjectTrustHandler): void;
 	on(event: "resources_discover", handler: ExtensionHandler<ResourcesDiscoverEvent, ResourcesDiscoverResult>): void;
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): void;
 	on(
@@ -1099,6 +1263,8 @@ export interface ExtensionAPI {
 	): void;
 	on(event: "session_compact", handler: ExtensionHandler<SessionCompactEvent>): void;
 	on(event: "session_shutdown", handler: ExtensionHandler<SessionShutdownEvent>): void;
+	on(event: "session_focus", handler: ExtensionHandler<SessionFocusEvent>): void;
+	on(event: "session_blur", handler: ExtensionHandler<SessionBlurEvent>): void;
 	on(event: "session_before_tree", handler: ExtensionHandler<SessionBeforeTreeEvent, SessionBeforeTreeResult>): void;
 	on(event: "session_tree", handler: ExtensionHandler<SessionTreeEvent>): void;
 	on(event: "context", handler: ExtensionHandler<ContextEvent, ContextEventResult>): void;
@@ -1306,6 +1472,13 @@ export interface ExtensionAPI {
 	 */
 	unregisterProvider(name: string): void;
 
+	// =========================================================================
+	// Sessions
+	// =========================================================================
+
+	/** Controller for managing live sessions (list, focus, create, close). */
+	sessions: SessionsController;
+
 	/** Shared event bus for extension communication. */
 	events: EventBus;
 }
@@ -1484,6 +1657,7 @@ export interface ExtensionActions {
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
 	setThinkingLevel: SetThinkingLevelHandler;
+	sessionsHost: SessionsHost;
 }
 
 /**

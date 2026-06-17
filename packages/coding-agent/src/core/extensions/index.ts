@@ -12,13 +12,14 @@ export {
 } from "./loader.ts";
 export type {
 	ExtensionErrorListener,
+	ExtensionEventObserver,
 	ForkHandler,
 	NavigateTreeHandler,
 	NewSessionHandler,
 	ShutdownHandler,
 	SwitchSessionHandler,
 } from "./runner.ts";
-export { ExtensionRunner } from "./runner.ts";
+export { emitProjectTrustEvent, ExtensionRunner, noOpUIContext } from "./runner.ts";
 export type {
 	AfterProviderResponseEvent,
 	AgentEndEvent,
@@ -97,6 +98,12 @@ export type {
 	MessageUpdateEvent,
 	ModelSelectEvent,
 	ModelSelectSource,
+	ObservableSessionEvent,
+	ProjectTrustContext,
+	ProjectTrustEvent,
+	ProjectTrustEventDecision,
+	ProjectTrustEventResult,
+	ProjectTrustHandler,
 	// Provider Registration
 	ProviderConfig,
 	ProviderModelConfig,
@@ -110,6 +117,7 @@ export type {
 	// Events - Resources
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
+	RuntimeSessionInfo,
 	SendMessageHandler,
 	SendUserMessageHandler,
 	SessionBeforeCompactEvent,
@@ -120,11 +128,17 @@ export type {
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeEvent,
 	SessionBeforeTreeResult,
+	SessionBlurEvent,
 	SessionCompactEvent,
 	SessionEvent,
+	SessionFocusEvent,
+	SessionHandle,
 	SessionShutdownEvent,
 	// Events - Session
 	SessionStartEvent,
+	SessionStatus,
+	SessionsController,
+	SessionsHost,
 	SessionTreeEvent,
 	SetActiveToolsHandler,
 	SetLabelHandler,
