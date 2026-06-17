@@ -56,6 +56,8 @@ import {
 	type ContextUsage,
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
+	type ExtensionEventObserver,
+	type ExtensionMode,
 	ExtensionRunner,
 	type ExtensionUIContext,
 	type InputSource,
@@ -66,6 +68,7 @@ import {
 	type SessionBeforeCompactResult,
 	type SessionBeforeTreeResult,
 	type SessionStartEvent,
+	type SessionsHost,
 	type ShutdownHandler,
 	type ToolDefinition,
 	type ToolExecutionEndEvent,
@@ -186,10 +189,31 @@ export interface AgentSessionConfig {
 export interface ExtensionBindings {
 	uiContext?: ExtensionUIContext;
 	commandContextActions?: ExtensionCommandContextActions;
+	/** Host (runtime) backing the `pi.sessions` controller. Absent in modes without multi-session support. */
+	sessionsHost?: SessionsHost;
 	abortHandler?: () => void;
 	shutdownHandler?: ShutdownHandler;
 	onError?: ExtensionErrorListener;
 }
+
+/**
+ * Stub `SessionsHost` used when no real host is bound (e.g. modes without
+ * multi-session support). Accessing `pi.sessions` then throws clearly.
+ */
+const throwingSessionsHost: SessionsHost = {
+	listSessions: () => {
+		throw new Error("sessions API not available");
+	},
+	getSession: () => {
+		throw new Error("sessions API not available");
+	},
+	observeSession: () => {
+		throw new Error("sessions API not available");
+	},
+	focusSession: () => Promise.reject(new Error("sessions API not available")),
+	createSession: () => Promise.reject(new Error("sessions API not available")),
+	closeSession: () => Promise.reject(new Error("sessions API not available")),
+};
 
 /** Options for AgentSession.prompt() */
 export interface PromptOptions {
@@ -298,10 +322,18 @@ export class AgentSession {
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
+	private _sessionsHost?: SessionsHost;
 	private _extensionAbortHandler?: () => void;
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
+	private _extensionsStarted = false;
+	/**
+	 * Set once dispose() runs. A session_start handler can re-entrantly close (dispose) its own
+	 * session mid-bind; bindExtensions checks this after emitting session_start to stop short of
+	 * running resource discovery / mutating a now-dead session.
+	 */
+	private _disposed = false;
 
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
@@ -450,7 +482,20 @@ export class AgentSession {
 	/** Emit an event to all listeners */
 	private _emit(event: AgentSessionEvent): void {
 		for (const l of this._eventListeners) {
-			l(event);
+			try {
+				l(event);
+			} catch (error) {
+				// A throwing listener (e.g. an extension's handle.on observer) must not
+				// abort dispatch to the remaining listeners, nor the session persistence
+				// that runs after _emit() in _handleAgentEvent. Surface it like other
+				// extension errors and continue.
+				this._extensionErrorListener?.({
+					extensionPath: "<session event listener>",
+					event: event.type,
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined,
+				});
+			}
 		}
 	}
 
@@ -708,6 +753,17 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._disposed = true;
+		try {
+			this.abortRetry();
+			this.abortCompaction();
+			this.abortBranchSummary();
+			this.abortBash();
+			this.agent.abort();
+		} catch {
+			// Dispose must succeed even if an abort hook throws.
+		}
+
 		this._extensionRunner.invalidate(
 			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 		);
@@ -738,6 +794,21 @@ export class AgentSession {
 	/** Whether agent is currently streaming a response */
 	get isStreaming(): boolean {
 		return this.agent.state.isStreaming;
+	}
+
+	/**
+	 * The message currently being streamed, if any. Set between `message_start`
+	 * and `message_end`; `undefined` once the message is persisted (and during
+	 * tool execution / idle). Lets a re-focused session re-attach to an in-flight
+	 * response without duplicating an already-persisted message.
+	 */
+	get streamingMessage(): AgentMessage | undefined {
+		return this.agent.state.streamingMessage;
+	}
+
+	/** Tool call ids currently executing. */
+	get pendingToolCalls(): ReadonlySet<string> {
+		return this.agent.state.pendingToolCalls;
 	}
 
 	/** Current effective system prompt (includes any per-turn extension modifications) */
@@ -804,6 +875,15 @@ export class AgentSession {
 			this._compactionAbortController !== undefined ||
 			this._branchSummaryAbortController !== undefined
 		);
+	}
+
+	/**
+	 * Whether branch summarization specifically is running (a subset of isCompacting).
+	 * Lets the UI label it correctly and wire Escape to abortBranchSummary() rather than
+	 * abortCompaction() — e.g. when reconciling the status line after a focus change.
+	 */
+	get isBranchSummarizing(): boolean {
+		return this._branchSummaryAbortController !== undefined;
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -1637,7 +1717,7 @@ export class AgentSession {
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
 
-			if (this._extensionRunner.hasHandlers("session_before_compact")) {
+			if (this._extensionRunner.hasHandlers("session_before_compact") || this._extensionRunner.hasObservers()) {
 				const result = (await this._extensionRunner.emit({
 					type: "session_before_compact",
 					preparation,
@@ -1903,7 +1983,7 @@ export class AgentSession {
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
 
-			if (this._extensionRunner.hasHandlers("session_before_compact")) {
+			if (this._extensionRunner.hasHandlers("session_before_compact") || this._extensionRunner.hasObservers()) {
 				const extensionResult = (await this._extensionRunner.emit({
 					type: "session_before_compact",
 					preparation,
@@ -2045,6 +2125,9 @@ export class AgentSession {
 		if (bindings.commandContextActions !== undefined) {
 			this._extensionCommandContextActions = bindings.commandContextActions;
 		}
+		if (bindings.sessionsHost !== undefined) {
+			this._sessionsHost = bindings.sessionsHost;
+		}
 		if (bindings.abortHandler !== undefined) {
 			this._extensionAbortHandler = bindings.abortHandler;
 		}
@@ -2056,7 +2139,26 @@ export class AgentSession {
 		}
 
 		this._applyExtensionBindings(this._extensionRunner);
+
+		// session_start and resource discovery are one-time-per-session lifecycle
+		// events. bindExtensions() runs again on every focus (the TUI re-binds the
+		// focused session's UI context), so emitting unconditionally would replay
+		// session_start and re-run resources_discover on each focus, duplicating
+		// extension side effects. Gate them to the first bind; later binds only
+		// re-apply the bindings above. (reload() emits these on its own path.)
+		if (this._extensionsStarted) {
+			return;
+		}
+		this._extensionsStarted = true;
+
 		await this._extensionRunner.emit(this._sessionStartEvent);
+		// A session_start handler can re-entrantly close (dispose) this very session — e.g. it
+		// calls pi.sessions.close() on itself. If so, stop here: running resource discovery would
+		// emit resources_discover on, and mutate the resources/system prompt of, a session that is
+		// already gone.
+		if (this._disposed) {
+			return;
+		}
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
 	}
 
@@ -2111,6 +2213,58 @@ export class AgentSession {
 		const base = basename(extensionPath);
 		const name = base.replace(/\.(ts|js)$/, "");
 		return `extension:${name}`;
+	}
+
+	/**
+	 * Drop this session's real (TUI) UI context so that, once backgrounded, its
+	 * extensions can no longer draw to or block on the shared terminal. The runner
+	 * falls back to its no-op UI (the same state freshly-created background sessions
+	 * have); the next `bindExtensions()` on re-focus re-attaches the real context.
+	 */
+	detachUI(backgroundUIContext?: ExtensionUIContext): void {
+		// An attended session is backgrounded with a deferring context (passed in): it
+		// stays mode "tui" with hasUI true, so gated extensions still call ctx.ui.* and
+		// their blocking prompts queue to replay on focus. An autonomous session passes
+		// none: the runner falls back to its no-op UI in "print" mode, so extensions take
+		// the non-interactive path (or get safe defaults) and never wait for a user.
+		// Re-focusing restores the real UI and "tui" via bindCurrentSessionExtensions().
+		this._extensionUIContext = backgroundUIContext;
+		this._extensionMode = backgroundUIContext ? "tui" : "print";
+		// Drop the focus-local command-context actions and abort handler too. Both are
+		// InteractiveMode closures that act on whatever session is *focused* (via its
+		// this.session getter). Left bound on this now-background session, an extension
+		// event or handle.on callback firing on it could call ctx.abort()/ctx.newSession()
+		// and drive the session focused now instead of this one — and ctx.abort() would
+		// skip aborting this session entirely. A freshly-created background session has
+		// neither bound; clearing them matches that. Re-focusing rebinds both via
+		// bindCurrentSessionExtensions(). (onError/shutdownHandler are intentionally left:
+		// onError keeps background extension errors from being silently swallowed.)
+		this._extensionCommandContextActions = undefined;
+		this._extensionAbortHandler = undefined;
+		this._applyExtensionBindings(this._extensionRunner);
+	}
+
+	/**
+	 * Notify extensions that this session just became the focused (interactive) one.
+	 * Fires on every focus, so extensions can (re)install UI the host tears down when
+	 * a session is backgrounded. Separate from the once-per-session session_start.
+	 */
+	async emitSessionFocus(): Promise<void> {
+		await this._extensionRunner.emit({ type: "session_focus" });
+	}
+
+	/** Notify extensions that this live session just lost focus (was backgrounded). */
+	async emitSessionBlur(): Promise<void> {
+		await this._extensionRunner.emit({ type: "session_blur" });
+	}
+
+	/**
+	 * Observe this session's mapped extension events (the pi.on vocabulary) with the
+	 * in-session context. Backs cross-session SessionHandle.on so observers receive the
+	 * same event shapes a same-session pi.on handler would, not the raw event stream.
+	 */
+	observeExtensionEvents(observer: ExtensionEventObserver): () => void {
+		return this._extensionRunner.observeEvents(observer);
 	}
 
 	private _applyExtensionBindings(runner: ExtensionRunner): void {
@@ -2207,6 +2361,18 @@ export class AgentSession {
 				},
 				getThinkingLevel: () => this.thinkingLevel,
 				setThinkingLevel: (level) => this.setThinkingLevel(level),
+				// Delegate lazily: `_sessionsHost` may be assigned by a later bindExtensions()
+				// call, after bindCore() has already copied these actions into the runtime.
+				sessionsHost: {
+					listSessions: () => (this._sessionsHost ?? throwingSessionsHost).listSessions(),
+					getSession: (id) => (this._sessionsHost ?? throwingSessionsHost).getSession(id),
+					observeSession: (id, observer) =>
+						(this._sessionsHost ?? throwingSessionsHost).observeSession(id, observer),
+					focusSession: (id) => (this._sessionsHost ?? throwingSessionsHost).focusSession(id),
+					createSession: (sessionOptions) =>
+						(this._sessionsHost ?? throwingSessionsHost).createSession(sessionOptions),
+					closeSession: (id) => (this._sessionsHost ?? throwingSessionsHost).closeSession(id),
+				},
 			},
 			{
 				getModel: () => this.model,
@@ -2706,7 +2872,7 @@ export class AgentSession {
 			let fromExtension = false;
 
 			// Emit session_before_tree event
-			if (this._extensionRunner.hasHandlers("session_before_tree")) {
+			if (this._extensionRunner.hasHandlers("session_before_tree") || this._extensionRunner.hasObservers()) {
 				const result = (await this._extensionRunner.emit({
 					type: "session_before_tree",
 					preparation,
