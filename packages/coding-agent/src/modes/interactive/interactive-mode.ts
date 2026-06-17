@@ -69,7 +69,9 @@ import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
+	ProjectTrustContext,
 } from "../../core/extensions/index.ts";
+import { noOpUIContext } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
@@ -173,6 +175,40 @@ type CompactionQueuedMessage = {
 	mode: "steer" | "followUp";
 };
 
+/**
+ * A focused session's transient, focus-local UI state. Snapshotted when the
+ * session blurs and restored when it is focused again, keyed by session id. This
+ * generalizes the old per-session editor-draft map to every focus-local piece of
+ * *core* UI state a session carries between turns. Extension-injected components
+ * (widgets/footer/header/custom editor) are deliberately NOT part of this — see
+ * resetExtensionUI for why they are re-established by the extension instead.
+ */
+type SessionUiState = {
+	/** Unsubmitted editor text. */
+	draft: string;
+	/** Messages the user queued while a compaction was running. */
+	compactionQueuedMessages: CompactionQueuedMessage[];
+	/** Whether the working spinner is allowed to show (an extension can hide it). */
+	workingVisible: boolean;
+	/** Custom working-spinner message set by an extension, if any. */
+	workingMessage: string | undefined;
+	/** Custom working-spinner indicator options set by an extension, if any. */
+	workingIndicatorOptions: LoaderIndicatorOptions | undefined;
+	/** Label shown in place of hidden thinking blocks (an extension can override it). */
+	hiddenThinkingLabel: string;
+};
+
+/**
+ * A UI prompt an attended session's extension issued while the session was
+ * backgrounded. Stored as a thunk that replays the call against the real UI when the
+ * session is focused, plus the promise the extension is awaiting.
+ */
+type DeferredPrompt = {
+	run: (ui: ExtensionUIContext) => Promise<unknown>;
+	resolve: (value: unknown) => void;
+	reject: (error: unknown) => void;
+};
+
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 
 function isDeadTerminalError(error: unknown): boolean {
@@ -192,6 +228,28 @@ function isAnthropicSubscriptionAuthKey(apiKey: string | undefined): boolean {
 
 function isUnknownModel(model: Model<any> | undefined): boolean {
 	return !!model && model.provider === "unknown" && model.id === "unknown" && model.api === "unknown";
+}
+
+function quoteIfNeeded(value: string): string {
+	if (value.length > 0 && !/[^a-zA-Z0-9_\-./~:@]/.test(value)) {
+		return value;
+	}
+	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+export function formatResumeCommand(sessionManager: SessionManager): string | undefined {
+	if (!process.stdout.isTTY) return undefined;
+	if (!sessionManager.isPersisted()) return undefined;
+
+	const sessionFile = sessionManager.getSessionFile();
+	if (!sessionFile || !fs.existsSync(sessionFile)) return undefined;
+
+	const args = [APP_NAME];
+	if (!sessionManager.usesDefaultSessionDir()) {
+		args.push("--session-dir", quoteIfNeeded(sessionManager.getSessionDir()));
+	}
+	args.push("--session", sessionManager.getSessionId());
+	return args.join(" ");
 }
 
 function hasDefaultModelProvider(providerId: string): providerId is keyof typeof defaultModelPerProvider {
@@ -242,6 +300,33 @@ export class InteractiveMode {
 	private statusContainer: Container;
 	private defaultEditor: CustomEditor;
 	private editor: EditorComponent;
+	/**
+	 * Per-session transient UI state, keyed by session id, preserved across focus
+	 * changes. Captured when a session blurs (captureSessionUiState) and restored
+	 * when it is focused again (restoreSessionFieldState for the field-backed parts,
+	 * plus the editor draft after the rebind). Pruned when a session is closed.
+	 */
+	private sessionUiState = new Map<string, SessionUiState>();
+	/**
+	 * Session ids whose persisted prompts have already been seeded into the editor's
+	 * history. rebindCurrentSession() re-renders on every focus, so this stops
+	 * renderInitialMessages() from re-adding a session's prompts on each refocus.
+	 * Pruned when a session is closed.
+	 */
+	private historyPopulatedSessions = new Set<string>();
+	/**
+	 * Per-session queues of UI prompts an attended session's extensions issued while it
+	 * was backgrounded. Replayed through the real UI when the session is focused
+	 * (drainDeferredPrompts); rejected if it is closed first. Autonomous sessions never
+	 * enqueue here — their backgrounded prompts proceed with a safe default immediately.
+	 */
+	private deferredPrompts = new Map<string, DeferredPrompt[]>();
+	/**
+	 * Resolvers fired when the focused session blurs. Lets drainDeferredPrompts race an
+	 * open replayed dialog against a focus change, so a prompt interrupted mid-dialog is
+	 * left queued for the next focus rather than hanging or showing in the wrong session.
+	 */
+	private blurWaiters = new Set<() => void>();
 	private editorComponentFactory: EditorFactory | undefined;
 	private autocompleteProvider: AutocompleteProvider | undefined;
 	private autocompleteProviderWrappers: AutocompleteProviderFactory[] = [];
@@ -310,6 +395,14 @@ export class InteractiveMode {
 	private retryCountdown: CountdownTimer | undefined = undefined;
 	private retryEscapeHandler?: () => void;
 
+	// The base Escape handler installed by setupKeyHandlers(). Transient features
+	// (compaction, retry, branch summary) temporarily override defaultEditor.onEscape
+	// and restore it on their own end event; on a focus change those end events may
+	// never reach this (now-backgrounded) session, so teardownTransientStatusUI()
+	// restores to this base to keep a leaked abort closure from firing on the wrong
+	// session. It is session-agnostic (reads the focused session via getters).
+	private baseEditorEscapeHandler?: () => void;
+
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
 
@@ -320,6 +413,14 @@ export class InteractiveMode {
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
+	// Resolver of the promise the dialog above is currently awaiting, cleared once the
+	// user makes a choice. If a dialog is torn down without one (e.g. its session is
+	// backgrounded mid-dialog and resetExtensionUI hides it), hideExtension* settles the
+	// pending promise as cancelled so the awaiting caller — including a deferred-prompt
+	// replay — can't leak a promise that would otherwise never resolve.
+	private extensionSelectorResolve: ((value: string | undefined) => void) | undefined = undefined;
+	private extensionInputResolve: ((value: string | undefined) => void) | undefined = undefined;
+	private extensionEditorResolve: ((value: string | undefined) => void) | undefined = undefined;
 	private extensionTerminalInputUnsubscribers = new Set<() => void>();
 
 	// Extension widgets (components rendered above/below the editor)
@@ -360,11 +461,71 @@ export class InteractiveMode {
 		this.runtimeHost = runtimeHost;
 		this.options = options;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
+			// Runs while this.session is still the OUTGOING focused session. Snapshot its
+			// transient UI state (draft, queued-during-compaction messages, working
+			// spinner + hidden-thinking label) BEFORE resetExtensionUI() collapses any
+			// custom editor back to the default one and resets the working/thinking
+			// fields to their defaults. Also runs during dispose/teardown, which is
+			// harmless. Restored on focus by restoreSessionFieldState() + the draft.
+			this.captureSessionUiState(this.session.sessionId);
 			this.resetExtensionUI();
+			// Release the outgoing session's transient status-line takeovers (loaders,
+			// retry countdown, Escape override, terminal progress) so they don't leak
+			// onto — or let Escape abort — the session focused next.
+			this.teardownTransientStatusUI();
+			// Detach the outgoing session's real UI so that, once backgrounded, its
+			// extensions can no longer paint or block on the terminal the now-focused
+			// session owns. An attended session gets a deferring UI context (its blocking
+			// prompts queue and replay when it is focused again); an autonomous session
+			// gets the no-op UI (prompts proceed with a safe default). Re-focusing
+			// re-attaches the real UI via bindCurrentSessionExtensions().
+			const outgoingId = this.session.sessionId;
+			const backgroundUI = this.runtimeHost.isAutonomous(outgoingId)
+				? undefined
+				: this.createDeferredUIContext(outgoingId);
+			this.session.detachUI(backgroundUI);
+			// Signal any in-flight deferred-prompt replay that focus is leaving, so it stops
+			// rather than continuing to drive the now-backgrounded session's prompts.
+			const waiters = [...this.blurWaiters];
+			this.blurWaiters.clear();
+			for (const wake of waiters) {
+				wake();
+			}
 		});
 		this.runtimeHost.setRebindSession(async () => {
 			await this.rebindCurrentSession();
+			// Runs after the focused pointer moved, so this.session is the NEW session.
+			// Restore its saved draft onto the final editor (empty for brand-new
+			// sessions). The field-backed state was already restored mid-rebind by
+			// restoreSessionFieldState() so the render could read it.
+			this.editor.setText(this.sessionUiState.get(this.session.sessionId)?.draft ?? "");
 		});
+		// Drop a closed session's retained UI state so it does not leak for the
+		// lifetime of the process.
+		this.runtimeHost.setOnSessionClosed((id) => {
+			this.sessionUiState.delete(id);
+			this.historyPopulatedSessions.delete(id);
+			// Reject any prompts the session deferred but never got to show, so the
+			// awaiting extension sees a clear error instead of hanging forever.
+			const pending = this.deferredPrompts.get(id);
+			if (pending) {
+				this.deferredPrompts.delete(id);
+				for (const prompt of pending) {
+					prompt.reject(new Error("Session closed before its deferred UI prompt could be shown"));
+				}
+			}
+		});
+		// A focused, API-created resume (pi.sessions.create({ resume, focus: true }))
+		// resolves project trust with the same interactive prompt as /resume.
+		this.runtimeHost.setProjectTrustContextFactory((cwd) => this.createProjectTrustContext(cwd));
+		// Surface extension errors from background (unfocused) sessions, which have no
+		// error listener of their own, in the focused TUI instead of dropping them.
+		this.runtimeHost.setOnBackgroundError((error) => {
+			this.showExtensionError(`${error.extensionPath} (background session)`, error.error, error.stack);
+		});
+		// Give attended background sessions the deferring UI from creation, so their prompts
+		// wait for focus rather than resolving with autonomous defaults until first focused.
+		this.runtimeHost.setBackgroundUIContextFactory((id) => this.createDeferredUIContext(id));
 		this.version = VERSION;
 		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
@@ -674,11 +835,14 @@ export class InteractiveMode {
 		this.ui.start();
 		this.isInitialized = true;
 
-		// Initialize extensions first so resources are shown before messages
+		// Initialize extensions and render the focused session. rebindCurrentSession
+		// shows loaded resources first, then renders the session's initial messages.
 		await this.rebindCurrentSession();
-
-		// Render initial messages AFTER showing loaded resources
-		this.renderInitialMessages();
+		// Emit the initial session_focus. Runtime-driven focus changes (and new/resume/fork/
+		// import replacements) emit it themselves; the very first session is set up here, not
+		// through the runtime's focus path, so fire it once explicitly to complete the pair
+		// with the blur the runtime emits when this session is later backgrounded.
+		await this.session.emitSessionFocus();
 
 		// Set up theme file watcher
 		onThemeChange(() => {
@@ -779,8 +943,11 @@ export class InteractiveMode {
 		// Main interactive loop
 		while (true) {
 			const userInput = await this.getUserInput();
+			// Bind to the session that owned the editor when the input was submitted, so a
+			// focus change between submit and prompt can't redirect it to another session.
+			const targetSession = this.session;
 			try {
-				await this.session.prompt(userInput);
+				await targetSession.prompt(userInput);
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -1484,6 +1651,8 @@ export class InteractiveMode {
 		const uiContext = this.createExtensionUIContext();
 		await this.session.bindExtensions({
 			uiContext,
+			mode: "tui",
+			sessionsHost: this.runtimeHost,
 			abortHandler: () => {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			},
@@ -1498,7 +1667,7 @@ export class InteractiveMode {
 					try {
 						const result = await this.runtimeHost.newSession(options);
 						if (!result.cancelled) {
-							this.renderCurrentSessionState();
+							// rebindCurrentSession (run inside newSession) already re-rendered.
 							this.ui.requestRender();
 						}
 						return result;
@@ -1510,7 +1679,7 @@ export class InteractiveMode {
 					try {
 						const result = await this.runtimeHost.fork(entryId, options);
 						if (!result.cancelled) {
-							this.renderCurrentSessionState();
+							// rebindCurrentSession (run inside fork) already re-rendered.
 							this.editor.setText(result.selectedText ?? "");
 							this.showStatus("Forked to new session");
 						}
@@ -1520,6 +1689,7 @@ export class InteractiveMode {
 					}
 				},
 				navigateTree: async (targetId, options) => {
+					const navSessionId = this.session.sessionId;
 					const result = await this.session.navigateTree(targetId, {
 						summarize: options?.summarize,
 						customInstructions: options?.customInstructions,
@@ -1528,6 +1698,14 @@ export class InteractiveMode {
 					});
 					if (result.cancelled) {
 						return { cancelled: true };
+					}
+
+					// If focus moved during the (possibly long) navigation, the result is
+					// already persisted on the now-backgrounded session and re-focusing it
+					// will re-render it; skip the shared-UI updates so they don't clobber
+					// the session focused now.
+					if (this.session.sessionId !== navSessionId) {
+						return { cancelled: false };
 					}
 
 					this.chatContainer.clear();
@@ -1588,11 +1766,211 @@ export class InteractiveMode {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.applyRuntimeSettings();
+		// Reset the previous session's rendered state BEFORE binding the new one.
+		// bindCurrentSessionExtensions() renders the focused session's loaded
+		// resources into chatContainer, so the reset must run first — otherwise it
+		// would wipe those freshly-rendered resources before the messages render.
+		this.resetRenderedSessionState();
+		// Restore the now-focused session's field-backed transient UI state right
+		// after the reset zeroes it, so the render steps below (pending-messages
+		// display, status indicator, thinking label) read this session's values
+		// rather than the previous session's leftovers or bare defaults.
+		this.restoreSessionFieldState(this.session.sessionId);
 		await this.bindCurrentSessionExtensions();
-		this.subscribeToAgent();
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
+		// Render the now-focused session's history after its resources. Centralizing
+		// the render here covers every path that re-binds the session: resume, new,
+		// fork (via finishSessionReplacement) AND focusSession (via the sessions API).
+		this.renderInitialMessages();
+		// Re-render the focused session's own queued (steering/follow-up) messages,
+		// which resetRenderedSessionState() cleared from the previous session.
+		this.updatePendingMessagesDisplay();
+		// Subscribe, re-attach to any in-flight stream, then reconcile the transient
+		// indicators (spinner / compaction / retry loaders, Escape override, terminal
+		// progress, in-progress tool state) that agent_start/compaction_start/
+		// auto_retry_start/tool_execution_* normally drive — all of which fired while
+		// this session was backgrounded and the TUI was unsubscribed. These are the
+		// final, await-free steps: subscribing immediately before the snapshot means a
+		// mid-focus event can neither be handled before reattach (double-render) nor
+		// slip into an await gap and be missed. All no-ops for an idle session.
+		this.subscribeToAgent();
+		this.reattachToStreamingMessage();
+		this.reconcileStatusUI();
+		this.markExecutingToolsStarted();
+		// renderInitialMessages()/reattach rebuilt the assistant components fresh, so
+		// re-apply this session's restored hidden-thinking label to them.
+		this.applyHiddenThinkingLabel();
+		// Replay any prompts this session deferred while backgrounded, now that it owns the
+		// real UI again. Fire-and-forget so the rebind completes; the prompts show sequentially
+		// as the user answers them. (session_focus is emitted by the runtime right after this
+		// rebind returns — see AgentSessionRuntime._focusSession / finishSessionReplacement.)
+		void this.drainDeferredPrompts(this.session.sessionId);
+		// If this session finished (or aborted) a compaction while it was backgrounded,
+		// its compaction_end handler never ran (the TUI was unsubscribed), so the
+		// messages it queued for after compaction were restored above but never sent.
+		// Now that it is focused AND idle, flush them — exactly what compaction_end
+		// would have done. If it is still busy (streaming/compacting/retrying) the
+		// messages stay queued and visible; flushing only on idle keeps us from
+		// prompting a session mid-turn.
+		if (
+			this.compactionQueuedMessages.length > 0 &&
+			!this.session.isStreaming &&
+			!this.session.isCompacting &&
+			!this.session.isRetrying
+		) {
+			void this.flushCompactionQueue({ willRetry: false });
+		}
+	}
+
+	/**
+	 * Tear every transient status-line takeover back to a clean baseline: the
+	 * working/compaction/retry loaders, the retry countdown, the Escape-handler
+	 * override, and terminal progress. These are all InteractiveMode-global single
+	 * fields, so on a focus change the outgoing session's takeovers must be released
+	 * or they leak onto — and let Escape abort — the session focused next. Idempotent.
+	 */
+	private teardownTransientStatusUI(): void {
+		if (this.loadingAnimation) {
+			this.loadingAnimation.stop();
+			this.loadingAnimation = undefined;
+		}
+		if (this.autoCompactionLoader) {
+			this.autoCompactionLoader.stop();
+			this.autoCompactionLoader = undefined;
+		}
+		this.retryCountdown?.dispose();
+		this.retryCountdown = undefined;
+		if (this.retryLoader) {
+			this.retryLoader.stop();
+			this.retryLoader = undefined;
+		}
+		this.statusContainer.clear();
+		// Restore the base Escape handler regardless of which transient feature
+		// (compaction, retry, branch summary, ...) overrode it. Each override aborts
+		// the *focused* session, so any leaked one would abort the wrong session after
+		// a focus change. Restoring to the captured base covers them all uniformly.
+		if (this.baseEditorEscapeHandler) {
+			this.defaultEditor.onEscape = this.baseEditorEscapeHandler;
+		}
+		this.autoCompactionEscapeHandler = undefined;
+		this.retryEscapeHandler = undefined;
+		if (this.settingsManager.getShowTerminalProgress()) {
+			this.ui.terminal.setProgress(false);
+		}
+	}
+
+	/**
+	 * After a focus change, rebuild the status-line indicator from the focused
+	 * session's live state. agent_start/compaction_start/auto_retry_start created
+	 * these while the session ran in the background (TUI unsubscribed), so re-derive
+	 * them: compaction and retry take precedence over plain streaming, each re-arms
+	 * Escape to cancel *this* session, and terminal progress tracks busy-ness. The
+	 * retry countdown is shown statically — its deadline isn't recoverable on focus.
+	 */
+	private reconcileStatusUI(): void {
+		this.teardownTransientStatusUI();
+		const session = this.session;
+		const cancelHint = `(${keyText("app.interrupt")} to cancel)`;
+		// Branch summarization reports isCompacting too, so check it FIRST and wire Escape
+		// to abortBranchSummary() — otherwise a refocus mid-summary would show "Compacting"
+		// and Escape would call abortCompaction(), losing the cancel path.
+		if (session.isBranchSummarizing) {
+			this.autoCompactionEscapeHandler = this.defaultEditor.onEscape;
+			this.defaultEditor.onEscape = () => this.session.abortBranchSummary();
+			this.autoCompactionLoader = new Loader(
+				this.ui,
+				(spinner) => theme.fg("accent", spinner),
+				(text) => theme.fg("muted", text),
+				`Summarizing branch... ${cancelHint}`,
+			);
+			this.statusContainer.addChild(this.autoCompactionLoader);
+		} else if (session.isCompacting) {
+			this.autoCompactionEscapeHandler = this.defaultEditor.onEscape;
+			this.defaultEditor.onEscape = () => this.session.abortCompaction();
+			this.autoCompactionLoader = new Loader(
+				this.ui,
+				(spinner) => theme.fg("accent", spinner),
+				(text) => theme.fg("muted", text),
+				`Compacting context... ${cancelHint}`,
+			);
+			this.statusContainer.addChild(this.autoCompactionLoader);
+		} else if (session.isRetrying) {
+			this.retryEscapeHandler = this.defaultEditor.onEscape;
+			this.defaultEditor.onEscape = () => this.session.abortRetry();
+			this.retryLoader = new Loader(
+				this.ui,
+				(spinner) => theme.fg("warning", spinner),
+				(text) => theme.fg("muted", text),
+				`Retrying... ${cancelHint}`,
+			);
+			this.statusContainer.addChild(this.retryLoader);
+		} else if (session.isStreaming && this.workingVisible) {
+			this.loadingAnimation = this.createWorkingLoader();
+			this.statusContainer.addChild(this.loadingAnimation);
+		}
+		if (this.settingsManager.getShowTerminalProgress()) {
+			this.ui.terminal.setProgress(session.isStreaming || session.isCompacting || session.isRetrying);
+		}
+	}
+
+	/**
+	 * Mark already-executing tools as started after a focus render. renderSessionContext
+	 * rebuilds tool components for persisted-but-unresolved tool calls but cannot tell
+	 * which are mid-execution (their tool_execution_start fired while the session was
+	 * backgrounded), so they would render as not-yet-started. The eventual
+	 * tool_execution_end still resolves them once delivered.
+	 */
+	private markExecutingToolsStarted(): void {
+		for (const toolCallId of this.session.pendingToolCalls) {
+			this.pendingTools.get(toolCallId)?.markExecutionStarted();
+		}
+	}
+
+	/**
+	 * Rebuild the live streaming view for a session focused mid-response.
+	 *
+	 * The session's `message_start` fired while it was backgrounded (the TUI was not
+	 * subscribed), so `streamingComponent` is unset and incoming `message_update`s
+	 * would be dropped. Reconstruct the component and pending tool views from the
+	 * in-flight message. `streamingMessage` is cleared on `message_end`, so this can
+	 * never duplicate a persisted message already drawn by `renderInitialMessages()`.
+	 */
+	private reattachToStreamingMessage(): void {
+		const streaming = this.session.streamingMessage;
+		if (!streaming || streaming.role !== "assistant") {
+			return;
+		}
+		this.streamingComponent = new AssistantMessageComponent(
+			undefined,
+			this.hideThinkingBlock,
+			this.getMarkdownThemeWithSettings(),
+			this.hiddenThinkingLabel,
+		);
+		this.streamingMessage = streaming;
+		this.chatContainer.addChild(this.streamingComponent);
+		this.streamingComponent.updateContent(this.streamingMessage);
+		for (const content of this.streamingMessage.content) {
+			if (content.type === "toolCall" && !this.pendingTools.has(content.id)) {
+				const component = new ToolExecutionComponent(
+					content.name,
+					content.id,
+					content.arguments,
+					{
+						showImages: this.settingsManager.getShowImages(),
+						imageWidthCells: this.settingsManager.getImageWidthCells(),
+					},
+					this.getRegisteredToolDefinition(content.name),
+					this.ui,
+					this.sessionManager.getCwd(),
+				);
+				component.setExpanded(this.toolOutputExpanded);
+				this.chatContainer.addChild(component);
+				this.pendingTools.set(content.id, component);
+			}
+		}
+		this.ui.requestRender();
 	}
 
 	private async handleFatalRuntimeError(prefix: string, error: unknown): Promise<never> {
@@ -1603,14 +1981,56 @@ export class InteractiveMode {
 		process.exit(1);
 	}
 
-	private renderCurrentSessionState(): void {
+	private resetRenderedSessionState(): void {
 		this.chatContainer.clear();
 		this.pendingMessagesContainer.clear();
 		this.compactionQueuedMessages = [];
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
 		this.pendingTools.clear();
-		this.renderInitialMessages();
+		// Drop the previous session's bash component so a chunk/completion callback
+		// still in flight for a backgrounded session cannot write into the newly
+		// focused session's view. A re-focused session rebuilds finished bash output
+		// from history via renderInitialMessages().
+		this.bashComponent = undefined;
+		// Drop bash components still queued from a "!" command run while the previous
+		// session was streaming. pendingMessagesContainer.clear() above removed them
+		// from view, but flushPendingBashComponents() on the next submit would
+		// otherwise append these other-session components into this session's chat.
+		this.pendingBashComponents = [];
+	}
+
+	/**
+	 * Snapshot the focused session's transient UI state before it blurs, keyed by
+	 * its (still-current) session id. MUST run before resetExtensionUI(), which
+	 * resets the working/thinking fields to their defaults.
+	 */
+	private captureSessionUiState(sessionId: string): void {
+		this.sessionUiState.set(sessionId, {
+			draft: this.editor.getText(),
+			compactionQueuedMessages: [...this.compactionQueuedMessages],
+			workingVisible: this.workingVisible,
+			workingMessage: this.workingMessage,
+			workingIndicatorOptions: this.workingIndicatorOptions,
+			hiddenThinkingLabel: this.hiddenThinkingLabel,
+		});
+	}
+
+	/**
+	 * Restore a newly-focused session's field-backed transient UI state (everything
+	 * except the editor draft, which is restored onto the final editor after the
+	 * rebind). Runs inside rebindCurrentSession after resetRenderedSessionState()
+	 * has zeroed these fields and before updatePendingMessagesDisplay() /
+	 * reconcileStatusUI() read them. A brand-new session has no snapshot, so it
+	 * falls back to the same defaults resetExtensionUI() applies on blur.
+	 */
+	private restoreSessionFieldState(sessionId: string): void {
+		const state = this.sessionUiState.get(sessionId);
+		this.compactionQueuedMessages = state ? [...state.compactionQueuedMessages] : [];
+		this.workingVisible = state?.workingVisible ?? true;
+		this.workingMessage = state?.workingMessage;
+		this.workingIndicatorOptions = state?.workingIndicatorOptions;
+		this.hiddenThinkingLabel = state?.hiddenThinkingLabel ?? this.defaultHiddenThinkingLabel;
 	}
 
 	/**
@@ -1627,28 +2047,43 @@ export class InteractiveMode {
 		const shortcuts = extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig());
 		if (shortcuts.size === 0) return;
 
-		// Create a context for shortcut handlers
-		const createContext = (): ExtensionContext => ({
+		// Create a context for shortcut handlers, bound to a specific session (the one
+		// focused when the shortcut fired, passed in below). A handler can await across
+		// a focus change, so session-scoped queries/actions must target that session,
+		// not whatever is focused later. Host-global actions (drawing UI, the editor
+		// queue, shutdown) stay bound to the live focused host.
+		const createContext = (session: AgentSession): ExtensionContext => ({
 			ui: this.createExtensionUIContext(),
 			hasUI: true,
-			cwd: this.sessionManager.getCwd(),
-			sessionManager: this.sessionManager,
-			modelRegistry: this.session.modelRegistry,
-			model: this.session.model,
-			isIdle: () => !this.session.isStreaming,
-			signal: this.session.agent.signal,
+			cwd: session.sessionManager.getCwd(),
+			sessionManager: session.sessionManager,
+			modelRegistry: session.modelRegistry,
+			model: session.model,
+			isIdle: () => !session.isStreaming,
+			isProjectTrusted: () => session.settingsManager.isProjectTrusted(),
+			signal: session.agent.signal,
 			abort: () => {
-				this.restoreQueuedMessagesToEditor({ abort: true });
+				// A handler can await across a focus change, so abort the session that was
+				// focused when the shortcut fired — not whatever is focused now. Only restore
+				// queued messages to the live editor when that session is still focused;
+				// otherwise just clear its queue and stop its turn, leaving the now-focused
+				// session's editor and queue untouched.
+				if (this.session.sessionId === session.sessionId) {
+					this.restoreQueuedMessagesToEditor({ abort: true });
+				} else {
+					session.clearQueue();
+					session.agent.abort();
+				}
 			},
-			hasPendingMessages: () => this.session.pendingMessageCount > 0,
+			hasPendingMessages: () => session.pendingMessageCount > 0,
 			shutdown: () => {
 				this.shutdownRequested = true;
 			},
-			getContextUsage: () => this.session.getContextUsage(),
+			getContextUsage: () => session.getContextUsage(),
 			compact: (options) => {
 				void (async () => {
 					try {
-						const result = await this.session.compact(options?.customInstructions);
+						const result = await session.compact(options?.customInstructions);
 						options?.onComplete?.(result);
 					} catch (error) {
 						const err = error instanceof Error ? error : new Error(String(error));
@@ -1656,7 +2091,7 @@ export class InteractiveMode {
 					}
 				})();
 			},
-			getSystemPrompt: () => this.session.systemPrompt,
+			getSystemPrompt: () => session.systemPrompt,
 		});
 
 		// Set up the extension shortcut handler on the default editor
@@ -1664,8 +2099,10 @@ export class InteractiveMode {
 			for (const [shortcutStr, shortcut] of shortcuts) {
 				// Cast to KeyId - extension shortcuts use the same format
 				if (matchesKey(data, shortcutStr as KeyId)) {
+					// Bind the context to the session focused at invocation time.
+					const ctx = createContext(this.session);
 					// Run handler async, don't block input
-					Promise.resolve(shortcut.handler(createContext())).catch((err) => {
+					Promise.resolve(shortcut.handler(ctx)).catch((err) => {
 						this.showError(`Shortcut handler error: ${err instanceof Error ? err.message : String(err)}`);
 					});
 					return true;
@@ -1728,6 +2165,17 @@ export class InteractiveMode {
 
 	private setHiddenThinkingLabel(label?: string): void {
 		this.hiddenThinkingLabel = label ?? this.defaultHiddenThinkingLabel;
+		this.applyHiddenThinkingLabel();
+		this.ui.requestRender();
+	}
+
+	/**
+	 * Push the current hidden-thinking label onto every rendered assistant message
+	 * and the live streaming component. Used both by setHiddenThinkingLabel() and,
+	 * on focus, after renderInitialMessages() rebuilds the components from scratch
+	 * (so a session's restored label re-applies to its freshly-rendered history).
+	 */
+	private applyHiddenThinkingLabel(): void {
 		for (const child of this.chatContainer.children) {
 			if (child instanceof AssistantMessageComponent) {
 				child.setHiddenThinkingLabel(this.hiddenThinkingLabel);
@@ -1736,7 +2184,6 @@ export class InteractiveMode {
 		if (this.streamingComponent) {
 			this.streamingComponent.setHiddenThinkingLabel(this.hiddenThinkingLabel);
 		}
-		this.ui.requestRender();
 	}
 
 	/**
@@ -1796,6 +2243,14 @@ export class InteractiveMode {
 		this.renderWidgets();
 	}
 
+	// Tear all extension-injected UI back to the host defaults. Called on blur (so
+	// a backgrounded session can no longer paint the focused session's terminal) and
+	// on reload. The field-backed working/thinking state reset at the end is first
+	// snapshotted by captureSessionUiState() and restored on focus, so it round-trips.
+	// The extension *components* (custom editor, footer, header, widgets, autocomplete
+	// wrappers, terminal-input listeners) are intentionally NOT snapshotted/restored:
+	// they are live objects owned by the session's extension runtime and are
+	// re-established by the extension itself, not replayed by the host.
 	private resetExtensionUI(): void {
 		if (this.extensionSelector) {
 			this.hideExtensionSelector();
@@ -1961,6 +2416,154 @@ export class InteractiveMode {
 	/**
 	 * Create the ExtensionUIContext for extensions.
 	 */
+	private createProjectTrustContext(cwd: string): ProjectTrustContext {
+		const ui = this.createExtensionUIContext();
+		return {
+			cwd,
+			mode: "tui",
+			hasUI: true,
+			ui: {
+				select: ui.select,
+				confirm: ui.confirm,
+				input: ui.input,
+				notify: ui.notify,
+			},
+		};
+	}
+
+	/**
+	 * The UI context an attended session uses while backgrounded. Blocking prompts
+	 * (select/confirm/input/editor) enqueue a thunk and return its pending promise, so
+	 * the agent waits rather than getting a silent default; the prompt replays through
+	 * the real UI when the session is focused (drainDeferredPrompts). Everything else is
+	 * a no-op — a backgrounded session must not paint the focused terminal. custom()
+	 * overlays are left no-op (deferring an interactive overlay is rare).
+	 */
+	private createDeferredUIContext(sessionId: string): ExtensionUIContext {
+		const defer = <T>(
+			run: (ui: ExtensionUIContext) => Promise<T>,
+			opts: ExtensionUIDialogOptions | undefined,
+			cancelDefault: T,
+		): Promise<T> =>
+			new Promise<T>((resolve, reject) => {
+				const signal = opts?.signal;
+				let abortHandler: (() => void) | undefined;
+				const detach = () => {
+					if (signal && abortHandler) signal.removeEventListener("abort", abortHandler);
+				};
+				const entry: DeferredPrompt = {
+					run: run as (ui: ExtensionUIContext) => Promise<unknown>,
+					// Drop the abort listener once the prompt settles (drained on focus, or aborted)
+					// so a queued prompt's signal can't keep the listener — and this closure — alive.
+					resolve: (value) => {
+						detach();
+						(resolve as (value: unknown) => void)(value);
+					},
+					reject: (error) => {
+						detach();
+						reject(error);
+					},
+				};
+				const queue = this.deferredPrompts.get(sessionId) ?? [];
+				queue.push(entry);
+				this.deferredPrompts.set(sessionId, queue);
+				// Honor the dialog's abort signal even while deferred: an extension/agent that
+				// aborts a backgrounded prompt must not stay blocked until focus. While the prompt
+				// is still queued (the session is not focused), drop it and settle with the dialog's
+				// cancel default. Once the session is focused its drain owns the prompt — a shown
+				// dialog honors the signal itself, an unshown one short-circuits on the next pull —
+				// so leave it to that path.
+				//
+				// There is intentionally NO timeout handling here: a dialog's { timeout } countdown
+				// starts only when the dialog is shown (on focus), so a backgrounded prompt simply
+				// waits for focus. (A backgrounded session_start never reaches this context — it is
+				// bound non-interactively; see AgentSessionRuntime._createSession.)
+				if (signal) {
+					if (signal.aborted) {
+						this.removeDeferredPrompt(sessionId, entry);
+						entry.resolve(cancelDefault);
+						return;
+					}
+					abortHandler = () => {
+						if (this.session.sessionId === sessionId) return;
+						this.removeDeferredPrompt(sessionId, entry);
+						entry.resolve(cancelDefault);
+					};
+					signal.addEventListener("abort", abortHandler, { once: true });
+				}
+			});
+		return {
+			...noOpUIContext,
+			select: (title, options, opts) => defer((ui) => ui.select(title, options, opts), opts, undefined),
+			confirm: (title, message, opts) => defer((ui) => ui.confirm(title, message, opts), opts, false),
+			input: (title, placeholder, opts) => defer((ui) => ui.input(title, placeholder, opts), opts, undefined),
+			editor: (title, prefill) => defer((ui) => ui.editor(title, prefill), undefined, undefined),
+		};
+	}
+
+	/** Remove a specific deferred prompt from a session's queue (e.g. when its signal aborts). */
+	private removeDeferredPrompt(sessionId: string, entry: DeferredPrompt): void {
+		const queue = this.deferredPrompts.get(sessionId);
+		if (!queue) return;
+		const index = queue.indexOf(entry);
+		if (index >= 0) queue.splice(index, 1);
+		if (queue.length === 0) this.deferredPrompts.delete(sessionId);
+	}
+
+	/**
+	 * Replay an attended session's deferred prompts through the real UI, in order, once
+	 * it is focused. Re-checks focus before each prompt and pulls one at a time from the
+	 * live queue: if focus moves away mid-drain, the unshown prompts stay queued and
+	 * replay when this session is focused again, rather than being shown in — or hanging
+	 * on — whatever session is focused now.
+	 */
+	private async drainDeferredPrompts(sessionId: string): Promise<void> {
+		while (this.session.sessionId === sessionId) {
+			const queue = this.deferredPrompts.get(sessionId);
+			// Peek, don't remove yet: if focus leaves while this prompt's dialog is open we
+			// must leave it queued (its promise still pending) to replay on the next focus.
+			const prompt = queue?.[0];
+			if (!prompt) {
+				if (queue) {
+					this.deferredPrompts.delete(sessionId);
+				}
+				return;
+			}
+			// Own the focus-loss signal directly instead of racing it against the dialog's
+			// teardown. On blur, beforeSessionInvalidate both flips this flag AND (via
+			// resetExtensionUI) resolves the open dialog as a cancellation; racing the two
+			// is order-dependent — if the teardown's resolution lands first it looks like a
+			// real answer and the prompt is shifted off the queue and lost. Checking a flag
+			// after the dialog settles makes the order in which blur does the two irrelevant.
+			let cancelledByBlur = false;
+			const onBlur = () => {
+				cancelledByBlur = true;
+			};
+			this.blurWaiters.add(onBlur);
+			let settled: { value: unknown } | { error: unknown };
+			try {
+				settled = await prompt.run(this.createExtensionUIContext()).then(
+					(value) => ({ value }),
+					(error) => ({ error }),
+				);
+			} finally {
+				this.blurWaiters.delete(onBlur);
+			}
+			// Focus left mid-dialog: the resolution above is the teardown's cancellation, not a
+			// user answer. Leave the prompt at the head of the queue (its promise still pending)
+			// so it replays — and resolves — when this session is focused again.
+			if (cancelledByBlur) {
+				return;
+			}
+			queue.shift();
+			if ("error" in settled) {
+				prompt.reject(settled.error);
+			} else {
+				prompt.resolve(settled.value);
+			}
+		}
+	}
+
 	private createExtensionUIContext(): ExtensionUIContext {
 		return {
 			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
@@ -2032,7 +2635,12 @@ export class InteractiveMode {
 				return;
 			}
 
+			// hideExtensionSelector() settles this if the dialog is torn down without a
+			// choice; a user choice below claims the resolution first (clears the field),
+			// making the hide a no-op so it can't override the chosen value.
+			this.extensionSelectorResolve = resolve;
 			const onAbort = () => {
+				this.extensionSelectorResolve = undefined;
 				this.hideExtensionSelector();
 				resolve(undefined);
 			};
@@ -2043,11 +2651,13 @@ export class InteractiveMode {
 				options,
 				(option) => {
 					opts?.signal?.removeEventListener("abort", onAbort);
+					this.extensionSelectorResolve = undefined;
 					this.hideExtensionSelector();
 					resolve(option);
 				},
 				() => {
 					opts?.signal?.removeEventListener("abort", onAbort);
+					this.extensionSelectorResolve = undefined;
 					this.hideExtensionSelector();
 					resolve(undefined);
 				},
@@ -2069,6 +2679,11 @@ export class InteractiveMode {
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
 		this.extensionSelector = undefined;
+		// Torn down without a user choice (still pending): settle as cancelled so the
+		// awaiting caller doesn't leak. A claimed choice already cleared this.
+		const resolve = this.extensionSelectorResolve;
+		this.extensionSelectorResolve = undefined;
+		resolve?.(undefined);
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
 	}
@@ -2107,7 +2722,11 @@ export class InteractiveMode {
 				return;
 			}
 
+			// See showExtensionSelector: hideExtensionInput() settles this on a choiceless
+			// teardown; a user choice clears the field first so the hide is a no-op.
+			this.extensionInputResolve = resolve;
 			const onAbort = () => {
+				this.extensionInputResolve = undefined;
 				this.hideExtensionInput();
 				resolve(undefined);
 			};
@@ -2118,11 +2737,13 @@ export class InteractiveMode {
 				placeholder,
 				(value) => {
 					opts?.signal?.removeEventListener("abort", onAbort);
+					this.extensionInputResolve = undefined;
 					this.hideExtensionInput();
 					resolve(value);
 				},
 				() => {
 					opts?.signal?.removeEventListener("abort", onAbort);
+					this.extensionInputResolve = undefined;
 					this.hideExtensionInput();
 					resolve(undefined);
 				},
@@ -2144,6 +2765,9 @@ export class InteractiveMode {
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
 		this.extensionInput = undefined;
+		const resolve = this.extensionInputResolve;
+		this.extensionInputResolve = undefined;
+		resolve?.(undefined);
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
 	}
@@ -2153,16 +2777,21 @@ export class InteractiveMode {
 	 */
 	private showExtensionEditor(title: string, prefill?: string): Promise<string | undefined> {
 		return new Promise((resolve) => {
+			// See showExtensionSelector: hideExtensionEditor() settles this on a choiceless
+			// teardown; a user choice clears the field first so the hide is a no-op.
+			this.extensionEditorResolve = resolve;
 			this.extensionEditor = new ExtensionEditorComponent(
 				this.ui,
 				this.keybindings,
 				title,
 				prefill,
 				(value) => {
+					this.extensionEditorResolve = undefined;
 					this.hideExtensionEditor();
 					resolve(value);
 				},
 				() => {
+					this.extensionEditorResolve = undefined;
 					this.hideExtensionEditor();
 					resolve(undefined);
 				},
@@ -2182,6 +2811,9 @@ export class InteractiveMode {
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
 		this.extensionEditor = undefined;
+		const resolve = this.extensionEditorResolve;
+		this.extensionEditorResolve = undefined;
+		resolve?.(undefined);
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
 	}
@@ -2403,6 +3035,7 @@ export class InteractiveMode {
 				}
 			}
 		};
+		this.baseEditorEscapeHandler = this.defaultEditor.onEscape;
 
 		// Register app action handlers
 		this.defaultEditor.onAction("app.clear", () => this.handleCtrlC());
@@ -3193,9 +3826,15 @@ export class InteractiveMode {
 	renderInitialMessages(): void {
 		// Get aligned messages and entries from session context
 		const context = this.sessionManager.buildSessionContext();
+		// Seed the editor's prompt history only on a session's first render. This runs
+		// again on every focus (via rebindCurrentSession), and the editor dedups only
+		// *consecutive* entries, so re-seeding each refocus would fill up-arrow history
+		// with repeated prompts.
+		const populateHistory = !this.historyPopulatedSessions.has(this.session.sessionId);
+		this.historyPopulatedSessions.add(this.session.sessionId);
 		this.renderSessionContext(context, {
 			updateFooter: true,
-			populateHistory: true,
+			populateHistory,
 		});
 
 		// Show compaction info if session was compacted
@@ -3257,8 +3896,18 @@ export class InteractiveMode {
 		// This prevents escape sequences from leaking to the parent shell over slow SSH.
 		await this.ui.terminal.drainInput(1000);
 
+		// Capture the focused session manager before dispose(): dispose() clears the
+		// runtime's session map, after which this.sessionManager (which reads the
+		// focused session) throws.
+		const focusedSessionManager = this.sessionManager;
 		this.stop();
 		await this.runtimeHost.dispose();
+
+		const resumeCommand = formatResumeCommand(focusedSessionManager);
+		if (resumeCommand) {
+			process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
+		}
+
 		process.exit(0);
 	}
 
@@ -3718,10 +4367,10 @@ export class InteractiveMode {
 		this.showStatus("Queued message for after compaction");
 	}
 
-	private isExtensionCommand(text: string): boolean {
+	private isExtensionCommand(text: string, session: AgentSession = this.session): boolean {
 		if (!text.startsWith("/")) return false;
 
-		const extensionRunner = this.session.extensionRunner;
+		const extensionRunner = session.extensionRunner;
 
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
@@ -3733,14 +4382,30 @@ export class InteractiveMode {
 			return;
 		}
 
+		// Bind to the session being flushed up front. The sends below await the agent,
+		// during which an extension could focus a different session; routing every send
+		// through this captured reference (rather than the this.session getter) keeps a
+		// focus change from delivering one session's queued messages to another.
+		const flushSession = this.session;
+		const flushSessionId = flushSession.sessionId;
 		const queuedMessages = [...this.compactionQueuedMessages];
 		this.compactionQueuedMessages = [];
 		this.updatePendingMessagesDisplay();
 
 		const restoreQueue = (error: unknown) => {
-			this.session.clearQueue();
-			this.compactionQueuedMessages = queuedMessages;
-			this.updatePendingMessagesDisplay();
+			flushSession.clearQueue();
+			// Put the unsent messages back where they belong: onto the live field if the
+			// flushed session is still focused, otherwise onto its retained snapshot so a
+			// focus change mid-flush does not clobber the now-focused session's queue.
+			if (this.session.sessionId === flushSessionId) {
+				this.compactionQueuedMessages = queuedMessages;
+				this.updatePendingMessagesDisplay();
+			} else {
+				const snapshot = this.sessionUiState.get(flushSessionId);
+				if (snapshot) {
+					snapshot.compactionQueuedMessages = queuedMessages;
+				}
+			}
 			this.showError(
 				`Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}: ${
 					error instanceof Error ? error.message : String(error)
@@ -3752,12 +4417,12 @@ export class InteractiveMode {
 			if (options?.willRetry) {
 				// When retry is pending, queue messages for the retry turn
 				for (const message of queuedMessages) {
-					if (this.isExtensionCommand(message.text)) {
-						await this.session.prompt(message.text);
+					if (this.isExtensionCommand(message.text, flushSession)) {
+						await flushSession.prompt(message.text);
 					} else if (message.mode === "followUp") {
-						await this.session.followUp(message.text);
+						await flushSession.followUp(message.text);
 					} else {
-						await this.session.steer(message.text);
+						await flushSession.steer(message.text);
 					}
 				}
 				this.updatePendingMessagesDisplay();
@@ -3765,11 +4430,13 @@ export class InteractiveMode {
 			}
 
 			// Find first non-extension-command message to use as prompt
-			const firstPromptIndex = queuedMessages.findIndex((message) => !this.isExtensionCommand(message.text));
+			const firstPromptIndex = queuedMessages.findIndex(
+				(message) => !this.isExtensionCommand(message.text, flushSession),
+			);
 			if (firstPromptIndex === -1) {
 				// All extension commands - execute them all
 				for (const message of queuedMessages) {
-					await this.session.prompt(message.text);
+					await flushSession.prompt(message.text);
 				}
 				return;
 			}
@@ -3780,22 +4447,22 @@ export class InteractiveMode {
 			const rest = queuedMessages.slice(firstPromptIndex + 1);
 
 			for (const message of preCommands) {
-				await this.session.prompt(message.text);
+				await flushSession.prompt(message.text);
 			}
 
 			// Send first prompt (starts streaming)
-			const promptPromise = this.session.prompt(firstPrompt.text).catch((error) => {
+			const promptPromise = flushSession.prompt(firstPrompt.text).catch((error) => {
 				restoreQueue(error);
 			});
 
 			// Queue remaining messages
 			for (const message of rest) {
-				if (this.isExtensionCommand(message.text)) {
-					await this.session.prompt(message.text);
+				if (this.isExtensionCommand(message.text, flushSession)) {
+					await flushSession.prompt(message.text);
 				} else if (message.mode === "followUp") {
-					await this.session.followUp(message.text);
+					await flushSession.followUp(message.text);
 				} else {
-					await this.session.steer(message.text);
+					await flushSession.steer(message.text);
 				}
 			}
 			this.updatePendingMessagesDisplay();
@@ -4208,7 +4875,7 @@ export class InteractiveMode {
 							return;
 						}
 
-						this.renderCurrentSessionState();
+						// rebindCurrentSession (run inside fork) already re-rendered.
 						this.editor.setText(result.selectedText ?? "");
 						done();
 						this.showStatus("Forked to new session");
@@ -4241,7 +4908,7 @@ export class InteractiveMode {
 				return;
 			}
 
-			this.renderCurrentSessionState();
+			// rebindCurrentSession (run inside fork) already re-rendered.
 			this.editor.setText("");
 			this.showStatus("Cloned to new session");
 		} catch (error: unknown) {
@@ -4312,6 +4979,13 @@ export class InteractiveMode {
 					// Set up escape handler and loader if summarizing
 					let summaryLoader: Loader | undefined;
 					const originalOnEscape = this.defaultEditor.onEscape;
+					// The Escape override, loader, and status container all belong to the
+					// focused session. Branch summarization can await for a while, during
+					// which an extension could focus a different session; capture the id so
+					// the post-await UI updates and the finally teardown only touch the
+					// shared UI when this session is still the focused one (otherwise they
+					// would clobber whatever session is focused now).
+					const summarySessionId = this.session.sessionId;
 
 					if (wantsSummary) {
 						this.defaultEditor.onEscape = () => {
@@ -4333,6 +5007,13 @@ export class InteractiveMode {
 							summarize: wantsSummary,
 							customInstructions,
 						});
+
+						// Focus moved away mid-summary: navigateTree already persisted the
+						// result on this (now-backgrounded) session and re-focusing it will
+						// re-render it, so skip every shared-UI update here.
+						if (this.session.sessionId !== summarySessionId) {
+							return;
+						}
 
 						if (result.aborted) {
 							// Summarization aborted - re-show tree selector with same selection
@@ -4356,11 +5037,18 @@ export class InteractiveMode {
 					} catch (error) {
 						this.showError(error instanceof Error ? error.message : String(error));
 					} finally {
-						if (summaryLoader) {
-							summaryLoader.stop();
-							this.statusContainer.clear();
+						// Always stop the loader so its spinner timer is freed even if focus
+						// moved (blur clears the status container but not this local loader).
+						summaryLoader?.stop();
+						// Only restore the shared status container / Escape handler while
+						// still focused; otherwise blur already reset them for the session
+						// focused now, and restoring here would clobber it.
+						if (this.session.sessionId === summarySessionId) {
+							if (summaryLoader) {
+								this.statusContainer.clear();
+							}
+							this.defaultEditor.onEscape = originalOnEscape;
 						}
-						this.defaultEditor.onEscape = originalOnEscape;
 					}
 				},
 				() => {
@@ -4429,7 +5117,7 @@ export class InteractiveMode {
 			if (result.cancelled) {
 				return result;
 			}
-			this.renderCurrentSessionState();
+			// rebindCurrentSession (run inside switchSession) already re-rendered.
 			this.showStatus("Resumed session");
 			return result;
 		} catch (error: unknown) {
@@ -4446,7 +5134,7 @@ export class InteractiveMode {
 				if (result.cancelled) {
 					return result;
 				}
-				this.renderCurrentSessionState();
+				// rebindCurrentSession (run inside switchSession) already re-rendered.
 				this.showStatus("Resumed session in current cwd");
 				return result;
 			}
@@ -5013,7 +5701,7 @@ export class InteractiveMode {
 				this.showStatus("Import cancelled");
 				return;
 			}
-			this.renderCurrentSessionState();
+			// rebindCurrentSession (run inside importFromJsonl) already re-rendered.
 			this.showStatus(`Session imported from: ${inputPath}`);
 		} catch (error: unknown) {
 			if (error instanceof MissingSessionCwdError) {
@@ -5027,7 +5715,7 @@ export class InteractiveMode {
 					this.showStatus("Import cancelled");
 					return;
 				}
-				this.renderCurrentSessionState();
+				// rebindCurrentSession (run inside importFromJsonl) already re-rendered.
 				this.showStatus(`Session imported from: ${inputPath}`);
 				return;
 			}
@@ -5366,7 +6054,7 @@ export class InteractiveMode {
 			if (result.cancelled) {
 				return;
 			}
-			this.renderCurrentSessionState();
+			// rebindCurrentSession (run inside newSession) already re-rendered.
 			this.chatContainer.addChild(new Spacer(1));
 			this.chatContainer.addChild(new Text(`${theme.fg("accent", "✓ New session started")}`, 1, 1));
 			this.ui.requestRender();
@@ -5433,14 +6121,21 @@ export class InteractiveMode {
 	}
 
 	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
-		const extensionRunner = this.session.extensionRunner;
+		// Capture the session this "!" command was submitted in. emitUserBash and (below)
+		// executeBash await, during which a user_bash handler could call pi.sessions.focus()
+		// and move focus elsewhere. Execution and persistence must target the session the
+		// command was typed in; and we only touch the live view while that session is still
+		// focused (otherwise its output re-renders from history when it is focused again).
+		const session = this.session;
+		const extensionRunner = session.extensionRunner;
+		const inView = () => this.session === session;
 
 		// Emit user_bash event to let extensions intercept
 		const eventResult = await extensionRunner.emitUserBash({
 			type: "user_bash",
 			command,
 			excludeFromContext,
-			cwd: this.sessionManager.getCwd(),
+			cwd: session.sessionManager.getCwd(),
 		});
 
 		// If extension returned a full result, use it directly
@@ -5448,75 +6143,111 @@ export class InteractiveMode {
 			const result = eventResult.result;
 
 			// Create UI component for display
-			this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
-			if (this.session.isStreaming) {
-				this.pendingMessagesContainer.addChild(this.bashComponent);
-				this.pendingBashComponents.push(this.bashComponent);
-			} else {
-				this.chatContainer.addChild(this.bashComponent);
+			const component = new BashExecutionComponent(command, this.ui, excludeFromContext);
+			if (inView()) {
+				if (session.isStreaming) {
+					this.pendingMessagesContainer.addChild(component);
+					this.pendingBashComponents.push(component);
+				} else {
+					this.chatContainer.addChild(component);
+				}
 			}
 
 			// Show output and complete
 			if (result.output) {
-				this.bashComponent.appendOutput(result.output);
+				component.appendOutput(result.output);
 			}
-			this.bashComponent.setComplete(
+			component.setComplete(
 				result.exitCode,
 				result.cancelled,
 				result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
 				result.fullOutputPath,
 			);
 
-			// Record the result in session
-			this.session.recordBashResult(command, result, { excludeFromContext });
-			this.bashComponent = undefined;
-			this.ui.requestRender();
+			// Record the result in the originating session
+			session.recordBashResult(command, result, { excludeFromContext });
+			if (inView()) {
+				this.ui.requestRender();
+			}
 			return;
 		}
 
 		// Normal execution path (possibly with custom operations)
-		const isDeferred = this.session.isStreaming;
-		this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
-
-		if (isDeferred) {
-			// Show in pending area when agent is streaming
-			this.pendingMessagesContainer.addChild(this.bashComponent);
-			this.pendingBashComponents.push(this.bashComponent);
-		} else {
-			// Show in chat immediately when agent is idle
-			this.chatContainer.addChild(this.bashComponent);
+		const isDeferred = session.isStreaming;
+		// Bind the streaming callbacks to this command's own component, not the shared
+		// this.bashComponent field. executeBash awaits, and with multi-session focus
+		// can move to another session that installs its own this.bashComponent; reading
+		// the field in the callbacks would then write this command's late chunks into
+		// the other session's component. The local reference always lands on its own.
+		const component = new BashExecutionComponent(command, this.ui, excludeFromContext);
+		// Only register as the focused session's active bash component while still focused.
+		if (inView()) {
+			this.bashComponent = component;
+			if (isDeferred) {
+				// Show in pending area when agent is streaming
+				this.pendingMessagesContainer.addChild(component);
+				this.pendingBashComponents.push(component);
+			} else {
+				// Show in chat immediately when agent is idle
+				this.chatContainer.addChild(component);
+			}
+			this.ui.requestRender();
 		}
-		this.ui.requestRender();
 
 		try {
-			const result = await this.session.executeBash(
+			const result = await session.executeBash(
 				command,
 				(chunk) => {
-					if (this.bashComponent) {
-						this.bashComponent.appendOutput(chunk);
+					component.appendOutput(chunk);
+					// Redraw only while this command's component is still the focused one;
+					// a backgrounded command's late chunks update an off-screen component.
+					if (this.bashComponent === component) {
 						this.ui.requestRender();
 					}
 				},
 				{ excludeFromContext, operations: eventResult?.operations },
 			);
 
-			if (this.bashComponent) {
-				this.bashComponent.setComplete(
-					result.exitCode,
-					result.cancelled,
-					result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
-					result.fullOutputPath,
-				);
-			}
+			component.setComplete(
+				result.exitCode,
+				result.cancelled,
+				result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
+				result.fullOutputPath,
+			);
 		} catch (error) {
-			if (this.bashComponent) {
-				this.bashComponent.setComplete(undefined, false);
+			const message = `Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`;
+			// Record the failure on this command's own component (always the originating
+			// session's, even if focus moved while executeBash awaited), and only surface the
+			// toast while still focused — an unconditional showError writes into whichever
+			// session happens to be focused now. Mirrors the inView()/bashComponent guards the
+			// success and chunk paths already use.
+			component.appendOutput(message);
+			component.setComplete(undefined, false);
+			if (inView()) {
+				this.showError(message);
 			}
-			this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
 		}
 
-		this.bashComponent = undefined;
-		this.ui.requestRender();
+		// The command settled and executeBash recorded it to history. If its session is focused
+		// but the component is detached — the session blurred mid-run (clearing the live
+		// containers) and was refocused before the command finished, so renderInitialMessages()
+		// could not rebuild it (not yet in history) — re-add it to chat so the finished output
+		// shows now instead of waiting for the next focus to rebuild it from history.
+		if (
+			inView() &&
+			!this.chatContainer.children.includes(component) &&
+			!this.pendingMessagesContainer.children.includes(component)
+		) {
+			this.chatContainer.addChild(component);
+		}
+		// Clear the shared field if it still points at this command's component (focus may have
+		// moved and another session installed its own meanwhile), and redraw while focused.
+		if (this.bashComponent === component) {
+			this.bashComponent = undefined;
+		}
+		if (inView()) {
+			this.ui.requestRender();
+		}
 	}
 
 	private async handleCompactCommand(customInstructions?: string): Promise<void> {

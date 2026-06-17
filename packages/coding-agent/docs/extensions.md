@@ -369,6 +369,45 @@ pi.on("session_start", async (event, ctx) => {
 });
 ```
 
+> **Background sessions: `session_start` is non-interactive.** When a session is created in
+> the background via `pi.sessions.create({ focus: false })`, its `session_start` (and
+> `resources_discover`) runs without an interactive UI: any `ctx.ui.confirm/select/input`
+> call returns the dialog's safe default immediately rather than blocking, and the user is
+> **not** re-asked when the session is later focused. Normal startup, focused creates, and
+> every prompt once a session is focused are unaffected; turn-time prompts on a background
+> session still block and surface when the session is focused.
+>
+> If an extension must ask the user at setup, detect the non-interactive context and defer
+> the prompt to [`session_focus`](#session_focus--session_blur), which fires whenever the
+> session becomes focused:
+>
+> ```typescript
+> pi.on("session_start", (event, ctx) => {
+>   if (!ctx.hasUI) return; // background create: don't prompt here
+>   // ...interactive setup...
+> });
+> ```
+
+#### session_focus / session_blur
+
+Fired when a session becomes the focused (interactive) session or loses focus to another.
+With multiple live sessions only one is focused at a time; the host tears down a session's
+interactive UI when it is backgrounded and rebuilds it on refocus.
+
+```typescript
+pi.on("session_focus", (_event, ctx) => {
+  // (Re)install focus-local UI here — footer, header, widgets, custom editor — that the
+  // host removes when the session is backgrounded. Fires on every focus, including the first.
+});
+pi.on("session_blur", (_event, ctx) => {
+  // The session is being backgrounded (but not torn down). Drop focus-local UI / listeners.
+});
+```
+
+Use `session_focus` (not `session_start`) for UI that must survive focus switches;
+`session_start` stays once-per-session, for data and side-effect setup. See the note under
+`session_start` for why background creates should defer interactive setup prompts to here.
+
 #### session_before_switch
 
 Fired before starting a new session (`/new`) or switching sessions (`/resume`).
