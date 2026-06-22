@@ -28,6 +28,7 @@ import type {
 	ExtensionError,
 	ExtensionEvent,
 	ExtensionFlag,
+	ExtensionMode,
 	ExtensionRuntime,
 	ExtensionShortcut,
 	ExtensionUIContext,
@@ -264,6 +265,7 @@ export class ExtensionRunner {
 	private extensions: Extension[];
 	private runtime: ExtensionRuntime;
 	private uiContext: ExtensionUIContext;
+	private mode: ExtensionMode = "print";
 	private cwd: string;
 	private sessionManager: SessionManager;
 	private modelRegistry: ModelRegistry;
@@ -395,8 +397,9 @@ export class ExtensionRunner {
 		this.reloadHandler = async () => {};
 	}
 
-	setUIContext(uiContext?: ExtensionUIContext): void {
+	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
 		this.uiContext = uiContext ?? noOpUIContext;
+		this.mode = mode;
 	}
 
 	getUIContext(): ExtensionUIContext {
@@ -667,6 +670,10 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.uiContext;
 			},
+			get mode() {
+				runner.assertActive();
+				return runner.mode;
+			},
 			get hasUI() {
 				runner.assertActive();
 				return runner.hasUI();
@@ -690,6 +697,9 @@ export class ExtensionRunner {
 			isIdle: () => {
 				runner.assertActive();
 				return runner.isIdleFn();
+			},
+			isProjectTrusted: () => {
+				return true;
 			},
 			get signal() {
 				runner.assertActive();

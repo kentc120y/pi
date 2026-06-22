@@ -43,6 +43,7 @@ export type CreateAgentSessionRuntimeFactory = (options: {
 	agentDir: string;
 	sessionManager: SessionManager;
 	sessionStartEvent?: SessionStartEvent;
+	projectTrustContext?: ProjectTrustContext;
 }) => Promise<CreateAgentSessionRuntimeResult>;
 
 /**

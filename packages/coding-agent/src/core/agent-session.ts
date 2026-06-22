@@ -188,6 +188,7 @@ export interface AgentSessionConfig {
 
 export interface ExtensionBindings {
 	uiContext?: ExtensionUIContext;
+	mode?: ExtensionMode;
 	commandContextActions?: ExtensionCommandContextActions;
 	/** Host (runtime) backing the `pi.sessions` controller. Absent in modes without multi-session support. */
 	sessionsHost?: SessionsHost;
@@ -321,6 +322,7 @@ export class AgentSession {
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
+	private _extensionMode?: ExtensionMode;
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
 	private _sessionsHost?: SessionsHost;
 	private _extensionAbortHandler?: () => void;
@@ -2122,6 +2124,9 @@ export class AgentSession {
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
 		}
+		if (bindings.mode !== undefined) {
+			this._extensionMode = bindings.mode;
+		}
 		if (bindings.commandContextActions !== undefined) {
 			this._extensionCommandContextActions = bindings.commandContextActions;
 		}
@@ -2268,7 +2273,7 @@ export class AgentSession {
 	}
 
 	private _applyExtensionBindings(runner: ExtensionRunner): void {
-		runner.setUIContext(this._extensionUIContext);
+		runner.setUIContext(this._extensionUIContext, this._extensionMode);
 		runner.bindCommandContext(this._extensionCommandContextActions);
 
 		this._extensionErrorUnsubscriber?.();

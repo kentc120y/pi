@@ -67,6 +67,8 @@ export type {
 	ExtensionFactory,
 	ExtensionFlag,
 	ExtensionHandler,
+	// Mode
+	ExtensionMode,
 	// Runtime
 	ExtensionRuntime,
 	ExtensionShortcut,

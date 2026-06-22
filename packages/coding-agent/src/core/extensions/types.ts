@@ -315,6 +315,8 @@ export interface ExtensionContext {
 	model: Model<any> | undefined;
 	/** Whether the agent is idle (not streaming) */
 	isIdle(): boolean;
+	/** Whether the current project is trusted */
+	isProjectTrusted(): boolean;
 	/** The current abort signal, or undefined when the agent is not streaming. */
 	signal: AbortSignal | undefined;
 	/** Abort the current agent operation */

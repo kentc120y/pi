@@ -47,6 +47,7 @@ import {
 	TUI,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
+import chalk from "chalk";
 import { spawn, spawnSync } from "child_process";
 import {
 	APP_NAME,
@@ -245,9 +246,6 @@ export function formatResumeCommand(sessionManager: SessionManager): string | un
 	if (!sessionFile || !fs.existsSync(sessionFile)) return undefined;
 
 	const args = [APP_NAME];
-	if (!sessionManager.usesDefaultSessionDir()) {
-		args.push("--session-dir", quoteIfNeeded(sessionManager.getSessionDir()));
-	}
 	args.push("--session", sessionManager.getSessionId());
 	return args.join(" ");
 }
@@ -2054,13 +2052,14 @@ export class InteractiveMode {
 		// queue, shutdown) stay bound to the live focused host.
 		const createContext = (session: AgentSession): ExtensionContext => ({
 			ui: this.createExtensionUIContext(),
+			mode: "tui",
 			hasUI: true,
 			cwd: session.sessionManager.getCwd(),
 			sessionManager: session.sessionManager,
 			modelRegistry: session.modelRegistry,
 			model: session.model,
 			isIdle: () => !session.isStreaming,
-			isProjectTrusted: () => session.settingsManager.isProjectTrusted(),
+			isProjectTrusted: () => true,
 			signal: session.agent.signal,
 			abort: () => {
 				// A handler can await across a focus change, so abort the session that was
